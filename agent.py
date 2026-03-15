@@ -19,27 +19,37 @@ import httpx
 from dotenv import load_dotenv
 
 # Maximum number of tool calls per question
-MAX_TOOL_CALLS = 10
+MAX_TOOL_CALLS = 20
 
 
 def load_config() -> dict:
-    """Load configuration from .env.agent.secret."""
-    env_path = Path(__file__).parent / ".env.agent.secret"
-    if not env_path.exists():
-        print(f"Error: {env_path} not found", file=sys.stderr)
-        sys.exit(1)
+    """Load configuration from environment files."""
+    # Load LLM config from .env.agent.secret
+    llm_env_path = Path(__file__).parent / ".env.agent.secret"
+    if llm_env_path.exists():
+        load_dotenv(llm_env_path, override=True)
 
-    load_dotenv(env_path)
+    # Load LMS API config from .env.docker.secret
+    lms_env_path = Path(__file__).parent / ".env.docker.secret"
+    if lms_env_path.exists():
+        load_dotenv(lms_env_path, override=True)
 
     config = {
-        "api_key": os.getenv("LLM_API_KEY"),
-        "api_base": os.getenv("LLM_API_BASE"),
-        "model": os.getenv("LLM_MODEL"),
+        # LLM configuration
+        "llm_api_key": os.getenv("LLM_API_KEY"),
+        "llm_api_base": os.getenv("LLM_API_BASE"),
+        "llm_model": os.getenv("LLM_MODEL"),
+        # Backend API configuration
+        "lms_api_key": os.getenv("LMS_API_KEY"),
+        "agent_api_base_url": os.getenv("AGENT_API_BASE_URL", "http://localhost:42002"),
     }
 
-    missing = [k for k, v in config.items() if not v]
-    if missing:
-        print(f"Error: Missing config values: {missing}", file=sys.stderr)
+    # Check required LLM values
+    llm_missing = [
+        k for k in ["llm_api_key", "llm_api_base", "llm_model"] if not config.get(k)
+    ]
+    if llm_missing:
+        print(f"Error: Missing LLM config values: {llm_missing}", file=sys.stderr)
         sys.exit(1)
 
     return config
@@ -134,9 +144,81 @@ def tool_list_files(path: str) -> str:
 
     try:
         entries = sorted([e.name for e in dir_path.iterdir()])
-        return "\n".join(entries)
+        # Filter out __init__.py and directories for code directories
+        if "routers" in path or "backend" in path:
+            entries = [e for e in entries if e.endswith(".py") and e != "__init__.py"]
+        result = "\n".join(entries)
+        # Add hint for LLM to read all files
+        if entries:
+            result += f"\n\n[Hint: To answer questions about this directory, read each file using read_file]"
+        return result
     except Exception as e:
         return f"Error listing directory: {e}"
+
+
+def tool_query_api(
+    method: str, path: str, body: str | None = None, authorize: bool = True
+) -> str:
+    """
+    Call the backend API and return the response.
+
+    Args:
+        method: HTTP method (GET, POST, etc.)
+        path: API endpoint path (e.g., '/items/')
+        body: Optional JSON request body
+        authorize: Whether to include Authorization header (default: True)
+
+    Returns:
+        JSON string with status_code and body, or error message
+    """
+    # Get API base URL from config (set via environment)
+    api_base = os.getenv("AGENT_API_BASE_URL", "http://localhost:42002")
+    api_key = os.getenv("LMS_API_KEY")
+
+    url = f"{api_base}{path}"
+
+    headers = {
+        "Content-Type": "application/json",
+    }
+
+    # Only include Authorization header if authorize=True and api_key is set
+    if authorize and api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    print(f"Calling API: {method} {url} (authorize={authorize})", file=sys.stderr)
+
+    try:
+        if method.upper() == "GET":
+            response = httpx.get(url, headers=headers, timeout=30.0)
+        elif method.upper() == "POST":
+            data = json.loads(body) if body else None
+            response = httpx.post(url, headers=headers, json=data, timeout=30.0)
+        elif method.upper() == "PUT":
+            data = json.loads(body) if body else None
+            response = httpx.put(url, headers=headers, json=data, timeout=30.0)
+        elif method.upper() == "DELETE":
+            response = httpx.delete(url, headers=headers, timeout=30.0)
+        elif method.upper() == "PATCH":
+            data = json.loads(body) if body else None
+            response = httpx.patch(url, headers=headers, json=data, timeout=30.0)
+        else:
+            return f"Error: Unknown method: {method}"
+
+        result = {
+            "status_code": response.status_code,
+            "body": response.text,
+        }
+
+        return json.dumps(result)
+
+    except httpx.TimeoutException:
+        return f"Error: API request timed out"
+    except httpx.ConnectError as e:
+        return f"Error: Cannot connect to API at {url}: {e}"
+    except json.JSONDecodeError:
+        return f"Error: Invalid JSON in body parameter"
+    except Exception as e:
+        return f"Error: {e}"
 
 
 # Tool definitions for LLM API
@@ -145,13 +227,13 @@ TOOLS_SCHEMA = [
         "type": "function",
         "function": {
             "name": "read_file",
-            "description": "Read a file from the project repository. Use this to read file contents.",
+            "description": "Read a file from the project repository. Use this to read wiki documentation or source code files.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "Relative path from project root (e.g., 'wiki/git-workflow.md')",
+                        "description": "Relative path from project root (e.g., 'wiki/git-workflow.md' or 'backend/main.py')",
                     }
                 },
                 "required": ["path"],
@@ -162,16 +244,47 @@ TOOLS_SCHEMA = [
         "type": "function",
         "function": {
             "name": "list_files",
-            "description": "List files and directories at a given path. Use this to discover what files exist.",
+            "description": "List files and directories at a given path. Use this to discover what files exist in a directory.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "Relative directory path from project root (e.g., 'wiki')",
+                        "description": "Relative directory path from project root (e.g., 'wiki' or 'backend')",
                     }
                 },
                 "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "query_api",
+            "description": "Call the backend API to query data, check system behavior, or test endpoints. Use this for questions about the running system, database contents, API responses, status codes, or analytics data.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "method": {
+                        "type": "string",
+                        "description": "HTTP method (GET, POST, PUT, DELETE, PATCH)",
+                        "enum": ["GET", "POST", "PUT", "DELETE", "PATCH"],
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "API endpoint path (e.g., '/items/', '/analytics/completion-rate', '/items/1/')",
+                    },
+                    "body": {
+                        "type": "string",
+                        "description": "Optional JSON request body for POST/PUT/PATCH requests",
+                    },
+                    "authorize": {
+                        "type": "boolean",
+                        "description": "Whether to include Authorization header (default: true). Set to false to test unauthenticated access.",
+                        "default": True,
+                    },
+                },
+                "required": ["method", "path"],
             },
         },
     },
@@ -181,32 +294,60 @@ TOOLS_SCHEMA = [
 TOOLS_MAP = {
     "read_file": tool_read_file,
     "list_files": tool_list_files,
+    "query_api": tool_query_api,
 }
 
-SYSTEM_PROMPT = """You are a documentation agent that answers questions using the project wiki.
+SYSTEM_PROMPT = """You are a documentation and system agent that answers questions using:
+1. The project wiki (via list_files and read_file tools)
+2. The running backend API (via query_api tool)
+3. The source code (via read_file tool)
 
-When asked a question:
-1. First use list_files to discover what files exist in the wiki/ directory
-2. Then use read_file to read relevant files
-3. Find the answer and note the exact file path and section
-4. Respond with the answer and include the source as: wiki/filename.md#section-anchor
+Tool selection guidance:
+- Use list_files to discover what files exist in a directory
+- Use read_file to read wiki documentation or source code files
+- Use query_api to:
+  - Query the database (GET /items/)
+  - Check API behavior (status codes, errors, responses)
+  - Get analytics data (GET /analytics/*)
+  - Test endpoints and check authentication
 
-Always include the source reference in your final answer. The source should be in the format: path/to/file.md#section-anchor
+query_api parameters:
+- method: HTTP method (GET, POST, PUT, DELETE, PATCH)
+- path: API endpoint path (e.g., '/items/', '/analytics/completion-rate')
+- body: Optional JSON request body for POST/PUT/PATCH
+- authorize: Whether to include Authorization header (default: true). Set authorize=false to test unauthenticated access and see 401 responses.
 
-If you don't know the answer, say so honestly."""
+When answering:
+1. Choose the right tool for the question type:
+   - Wiki/documentation questions → read_file on wiki/*.md
+   - System/runtime questions → query_api on backend endpoints
+   - Code questions → read_file on backend/app/*.py or backend/app/routers/*.py
+2. ALWAYS include a source reference at the end of your answer in this exact format:
+   - For wiki files: wiki/filename.md#section-anchor
+   - For code files: path/to/file.py
+   Example: "The answer is... wiki/github.md#branch-protection"
+3. For API questions, report actual data from the API response
+4. For code questions, read the relevant files and explain based on what you find
+
+Important paths:
+- Wiki files: wiki/*.md
+- Backend code: backend/app/*.py, backend/app/routers/*.py
+- Backend routers: backend/app/routers/items.py, backend/app/routers/interactions.py, backend/app/routers/analytics.py, backend/app/routers/pipeline.py, backend/app/routers/learners.py
+
+Always provide accurate answers based on actual data from tools, not assumptions. Give complete answers that address all parts of the question."""
 
 
 def call_llm(messages: list[dict], config: dict, tools: list | None = None) -> dict:
     """Call the LLM API and return the response."""
-    url = f"{config['api_base']}/chat/completions"
+    url = f"{config['llm_api_base']}/chat/completions"
 
     headers = {
         "Content-Type": "application/json",
-        "Authorization": f"Bearer {config['api_key']}",
+        "Authorization": f"Bearer {config['llm_api_key']}",
     }
 
     payload = {
-        "model": config["model"],
+        "model": config["llm_model"],
         "messages": messages,
     }
 
@@ -256,7 +397,32 @@ def run_agentic_loop(question: str, config: dict) -> tuple[str, str, list[dict]]
 
         if not tool_calls:
             # No tool calls - this is the final answer
-            answer = choice.get("content", "")
+            answer = choice.get("content") or ""
+
+            # Check if answer looks incomplete (only for very short answers)
+            # An answer is likely incomplete if it's under 50 chars and starts with "Let me"
+            is_very_short = len(answer) < 50
+            starts_with_delay = (
+                answer.lower().strip().startswith(("let me", "let's", "i'll", "i will"))
+            )
+
+            # If answer seems incomplete and we haven't hit max calls, ask for final answer
+            if (
+                is_very_short
+                and starts_with_delay
+                and tool_call_count < MAX_TOOL_CALLS - 2
+            ):
+                print(
+                    f"Answer seems incomplete, asking for final answer...",
+                    file=sys.stderr,
+                )
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": "Please provide your complete final answer now.",
+                    }
+                )
+                continue
 
             # Extract source from answer (look for pattern like wiki/file.md#section)
             source = extract_source(answer)
@@ -304,19 +470,19 @@ def run_agentic_loop(question: str, config: dict) -> tuple[str, str, list[dict]]
         if tool_call_count >= MAX_TOOL_CALLS:
             break
 
-    # If we exit loop without final answer, use last content or generate one
+    # If we exit loop without final answer, try to get one
     print(f"Exiting loop after {tool_call_count} tool calls", file=sys.stderr)
 
     # Try to get a final answer
     messages.append(
         {
             "role": "user",
-            "content": "Based on the tool results above, please provide your final answer with the source reference.",
+            "content": "Based on the tool results above, please provide your final answer.",
         }
     )
 
     response = call_llm(messages, config, tools=None)
-    answer = response["choices"][0]["message"].get("content", "")
+    answer = response["choices"][0]["message"].get("content") or ""
     source = extract_source(answer)
 
     return answer, source, all_tool_calls
@@ -325,16 +491,64 @@ def run_agentic_loop(question: str, config: dict) -> tuple[str, str, list[dict]]
 def extract_source(answer: str) -> str:
     """
     Extract source reference from the answer.
-    Looks for patterns like wiki/file.md#section or wiki/file.md
+    Looks for patterns like wiki/file.md#section or wiki/file.md or backend/app/routers/file.py
     """
     import re
 
-    # Look for markdown-style references: wiki/file.md#section or wiki/file.md
+    # First look for explicit wiki references: wiki/file.md#section or wiki/file.md
     pattern = r"(wiki/[\w\-/]+\.md(?:#[\w\-]+)?)"
     match = re.search(pattern, answer)
 
     if match:
         return match.group(1)
+
+    # Look for backend file references: backend/app/routers/file.py
+    pattern2 = r"(backend/[\w\-/]+\.py)"
+    match2 = re.search(pattern2, answer)
+
+    if match2:
+        return match2.group(1)
+
+    # Look for references like `github.md` or `file.md` mentioned in backticks
+    pattern3 = r"`([\w\-/]+\.md)(?:#([\w\-]+))?`"
+    match3 = re.search(pattern3, answer)
+
+    if match3:
+        filename = match3.group(1)
+        anchor = match3.group(2)
+        # Assume wiki/ for common wiki files
+        if filename in [
+            "github.md",
+            "git.md",
+            "git-workflow.md",
+            "git-vscode.md",
+            "gitlens.md",
+        ]:
+            if anchor:
+                return f"wiki/{filename}#{anchor}"
+            return f"wiki/{filename}"
+        return filename
+
+    # Look for file.md#section or file.md patterns without backticks
+    pattern4 = r"\b([\w\-]+\.md)(?:#([\w\-]+))?\b"
+    match4 = re.search(pattern4, answer)
+
+    if match4:
+        filename = match4.group(1)
+        anchor = match4.group(2)
+        # Assume wiki/ for common wiki files
+        if filename in [
+            "github.md",
+            "git.md",
+            "git-workflow.md",
+            "git-vscode.md",
+            "gitlens.md",
+            "ssh.md",
+            "vm.md",
+        ]:
+            if anchor:
+                return f"wiki/{filename}#{anchor}"
+            return f"wiki/{filename}"
 
     # If no source found, return empty string
     return ""
